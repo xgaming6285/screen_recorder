@@ -126,7 +126,6 @@ def record():
             "-video_size", f"{width}x{height}",
             "-i", "desktop",
         ] + encoder_flags + [
-            "-t", str(MINUTES_PER_FILE * 60),
             filename
         ]
         
@@ -140,12 +139,32 @@ def record():
             creationflags=PRIORITY_FLAG 
         )
         
+        start_time = time.time()
+        max_duration = MINUTES_PER_FILE * 60
+        stopped_by_user = False
+        
         try:
-            process.wait()
+            # Poll every second to check duration OR if user pressed Ctrl+C
+            while process.poll() is None:
+                elapsed = time.time() - start_time
+                if elapsed >= max_duration:
+                    # Time's up - gracefully stop and start new file
+                    process.stdin.write(b'q')
+                    process.stdin.flush()
+                    process.wait()
+                    break
+                time.sleep(1)
         except KeyboardInterrupt:
-            process.terminate()
-            print("\n🛑 Stopped.")
+            stopped_by_user = True
+            print("\n⏳ Finalizing video file...")
+            process.stdin.write(b'q')
+            process.stdin.flush()
+            process.wait()
+            print("🛑 Stopped. Video file saved correctly.")
+        
+        if stopped_by_user:
             break
+        
         time.sleep(1)
 
 if __name__ == "__main__":
