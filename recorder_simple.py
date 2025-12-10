@@ -1,105 +1,182 @@
 """
-Multi-Monitor Native Recorder (Teramind Style)
-- Auto-detects all monitors.
-- Spawns a DXGI capture engine for each screen.
-- Saves separate highly-compressed files for each monitor.
-- CPU Usage: Extremely Low (~2-4% total for 2 screens).
+Smart Motion-Activated Recorder (Teramind Style)
+- Motion Detection: Only records when screen changes.
+- Low FPS: optimized for desktop monitoring (5 FPS).
+- Result: Massive file size reduction.
 """
 
 import dxcam
 import cv2
 import time
 import ctypes
+import numpy as np
+import signal
+import sys
 from datetime import datetime
 from pathlib import Path
 
 # === SETTINGS ===
-OUTPUT_FOLDER = "recordings"
-FPS = 30.0
+OUTPUT_FOLDER = "smart_recordings"
+FPS = 5.0                # 5 FPS is standard for employee monitoring
+MOTION_THRESHOLD = 0.5   # 0.5% of pixels must change to trigger a write
+CHECK_INTERVAL = 1.0 / FPS
+STOP_FILE = Path(__file__).parent / ".stop_recording"
+
+# Global flag for graceful shutdown
+_should_stop = False
 
 def get_monitor_count():
-    """Detects the number of active monitors connected."""
     user32 = ctypes.windll.user32
     user32.SetProcessDPIAware()
-    return user32.GetSystemMetrics(80) # SM_CMONITORS
+    return user32.GetSystemMetrics(80)
 
-def record_multiscreen():
+
+def signal_handler(signum, frame):
+    """Handle termination signals gracefully."""
+    global _should_stop
+    print("\n🛑 Signal received, stopping gracefully...")
+    _should_stop = True
+
+
+def check_stop_signal():
+    """Check if we should stop (via file or flag)."""
+    global _should_stop
+    if _should_stop:
+        return True
+    if STOP_FILE.exists():
+        print("\n🛑 Stop file detected, stopping gracefully...")
+        _should_stop = True
+        return True
+    return False
+
+def record_smart():
+    global _should_stop
+    _should_stop = False
+    
+    # Clean up any leftover stop file
+    if STOP_FILE.exists():
+        STOP_FILE.unlink()
+    
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    if hasattr(signal, 'SIGBREAK'):  # Windows-specific
+        signal.signal(signal.SIGBREAK, signal_handler)
+    
     Path(OUTPUT_FOLDER).mkdir(exist_ok=True)
     num_monitors = get_monitor_count()
     
     print("=" * 60)
-    print(f"🕵️  MULTI-SCREEN RECORDER (Detected {num_monitors} Monitors)")
+    print(f"🧠 SMART RECORDER (Motion Activated)")
+    print(f"   Target FPS: {FPS} | Monitors: {num_monitors}")
     print("=" * 60)
 
     cameras = []
     writers = []
-    
+    last_frames = [] # To store the previous frame for comparison
+
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # --- 1. SETUP PHASE ---
+    # --- SETUP ---
     for i in range(num_monitors):
-        try:
-            print(f"   Initializing Monitor {i}...", end=" ")
-            
-            # Create a dedicated camera for this monitor index
-            cam = dxcam.create(output_idx=i, output_color="BGR")
-            
-            # Get specific resolution for THIS monitor (they might differ)
-            # dxcam automatically handles the resolution for the specific index
-            # We grab one frame to check the size ensuring accuracy
-            test_frame = cam.grab() 
-            if test_frame is None:
-                print("⚠️ Skipped (No signal)")
-                continue
-                
-            height, width, layers = test_frame.shape
-            print(f"✅ Ready ({width}x{height})")
+        cam = dxcam.create(output_idx=i, output_color="BGR")
+        
+        # Grab one frame to get size
+        frame = cam.grab()
+        if frame is None: continue
+        height, width, _ = frame.shape
+        
+        # Use 'mp4v'. If you have the DLL for H264, use 'avc1' for even smaller files.
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        filename = str(Path(OUTPUT_FOLDER) / f"smart_{timestamp}_mon{i}.mp4")
+        
+        out = cv2.VideoWriter(filename, fourcc, FPS, (width, height))
+        
+        cameras.append(cam)
+        writers.append(out)
+        last_frames.append(None) # Initialize "previous frame" as empty
+        
+        cam.start(target_fps=int(FPS), video_mode=True)
+        print(f"   ✅ Monitor {i} Ready")
 
-            # Create a VideoWriter for this specific monitor
-            filename = str(Path(OUTPUT_FOLDER) / f"rec_{timestamp}_mon{i}.mp4")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use 'avc1' if you have OpenH264
-            out = cv2.VideoWriter(filename, fourcc, FPS, (width, height))
-            
-            cameras.append(cam)
-            writers.append(out)
-            
-            # Start background capture
-            cam.start(target_fps=int(FPS), video_mode=True)
-            
-        except Exception as e:
-            print(f"❌ Failed: {e}")
+    print(f"▶️  Recording... (Static screens will be ignored)")
 
-    if not cameras:
-        print("❌ No monitors could be initialized.")
-        return
-
-    print("=" * 60)
-    print(f"▶️  Recording {len(cameras)} screens... (Press Ctrl+C to Stop)")
-
-    # --- 2. RECORDING LOOP ---
     try:
-        while True:
-            # We iterate through all cameras in a single loop
+        while not check_stop_signal():
+            start_loop = time.time()
+
             for i, cam in enumerate(cameras):
-                frame = cam.get_latest_frame() # Zero-copy grab from GPU
+                # Get current frame
+                frame = cam.get_latest_frame()
+                if frame is None: continue
+
+                # --- MOTION DETECTION LOGIC ---
+                should_write = False
                 
-                if frame is not None:
+                # If we have a previous frame, compare them
+                if last_frames[i] is not None:
+                    # 1. Convert to Gray for fast math (saves CPU)
+                    curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    prev_gray = cv2.cvtColor(last_frames[i], cv2.COLOR_BGR2GRAY)
+                    
+                    # 2. Calculate the difference (Absolute Difference)
+                    diff = cv2.absdiff(curr_gray, prev_gray)
+                    
+                    # 3. Threshold the difference (ignore tiny noise)
+                    # Any pixel change > 25 (out of 255) is considered "changed"
+                    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+                    
+                    # 4. Count changed pixels
+                    changed_pixels = np.count_nonzero(thresh)
+                    total_pixels = frame.shape[0] * frame.shape[1]
+                    change_percent = (changed_pixels / total_pixels) * 100
+
+                    # 5. Decide to write
+                    if change_percent > MOTION_THRESHOLD:
+                        should_write = True
+                else:
+                    # Always write the very first frame
+                    should_write = True
+
+                # --- WRITING ---
+                if should_write:
                     writers[i].write(frame)
-            
-            # Throttle loop slightly to save CPU
-            time.sleep(1 / FPS)
+                    last_frames[i] = frame.copy() # Update reference frame
+                else:
+                    # OPTIONAL: If you want the video to keep 'real time' accuracy 
+                    # but look frozen, you duplicate the previous frame. 
+                    # HOWEVER, to save space (Teramind style), we just skip writing.
+                    # Note: Skipping writing makes the video 'fast forward' through boring parts.
+                    pass
+
+            # Maintain the 5 FPS timing
+            elapsed = time.time() - start_loop
+            if elapsed < CHECK_INTERVAL:
+                time.sleep(CHECK_INTERVAL - elapsed)
 
     except KeyboardInterrupt:
-        print("\n🛑 Stopping all recordings...")
+        print("\n🛑 Stopping...")
 
-    # --- 3. CLEANUP ---
     finally:
-        for cam in cameras:
-            cam.stop()
-        for out in writers:
-            out.release()
+        print("   Finalizing video files...")
+        for cam in cameras: 
+            try:
+                cam.stop()
+            except:
+                pass
+        for out in writers: 
+            try:
+                out.release()
+            except:
+                pass
         cv2.destroyAllWindows()
-        print("✅ All files saved.")
+        # Clean up stop file
+        if STOP_FILE.exists():
+            try:
+                STOP_FILE.unlink()
+            except:
+                pass
+        print("✅ Done. Videos saved properly.")
 
 if __name__ == "__main__":
-    record_multiscreen()
+    record_smart()
